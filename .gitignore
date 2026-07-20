@@ -1,0 +1,17 @@
+# Local/ephemeral working artifacts — never commit secrets or scratch key material.
+.op-tmp/
+*.gnupg/
+gnupghome*/
+incoming/
+*.deb
+*.buildinfo
+*.changes
+
+# Signed index scratch (the real ones are generated in CI, deployed to Pages)
+/dists/
+/public/
+/_site/
+
+# OS / editor cruft
+.DS_Store
+*.swp
