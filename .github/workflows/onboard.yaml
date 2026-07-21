@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out control-plane repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - id: target
         name: Parse target repository
@@ -53,7 +53,7 @@ jobs:
 
       - name: Load secrets from 1Password
         id: op
-        uses: 1password/load-secrets-action@v2
+        uses: 1password/load-secrets-action@v4
         with:
           export-env: false
         env:

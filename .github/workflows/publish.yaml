@@ -66,10 +66,10 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout main (workflow + apt-ftparchive.conf)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Checkout durable pool branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: pool
           path: _pool
@@ -80,7 +80,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends gnupg dpkg-dev apt-utils
 
       - name: Install 1Password CLI
-        uses: 1password/install-cli-action@v1
+        uses: 1password/install-cli-action@v4
 
       - id: gpg
         name: Load signing material into an ephemeral keyring
@@ -295,10 +295,10 @@ jobs:
           fi
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
