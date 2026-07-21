@@ -1,0 +1,105 @@
+# yamllint disable rule:line-length
+---
+name: Onboard a package repository
+
+# Control-plane onboarding. Given a target "owner/repo", this mints a
+# short-lived GitHub App token scoped to ONLY that target, seeds the durable
+# APT_DISPATCH_TOKEN secret into it, and installs the publish-apt-packages.yaml
+# workflow, so the target's future releases feed this APT repo.
+#
+# One-time manual prerequisite per target: add the target repository to the
+# wondersmith-apt-control-plane App installation (the App is otherwise scoped
+# to select repositories only). If the token step fails with "not installed",
+# add the repo to the installation and re-run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        type: string
+        required: true
+        description: Target repository to onboard (owner/repo)
+
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onboard-${{ github.event.inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  onboard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out control-plane repo
+        uses: actions/checkout@v4
+
+      - id: target
+        name: Parse target repository
+        env:
+          TARGET: ${{ github.event.inputs.target }}
+        run: |
+          repo="${TARGET#*/}"
+          owner="${TARGET%%/*}"
+
+          if [ -z "${owner}" ] || [ -z "${repo}" ] || [ "${owner}" = "${TARGET}" ] || [ "${repo}" != "${repo#*/}" ]; then
+            echo "::error::target must be in 'owner/repo' form (got '${TARGET}')"
+            exit 1
+          fi
+
+          echo "repo=${repo}" >> "${GITHUB_OUTPUT}"
+          echo "owner=${owner}" >> "${GITHUB_OUTPUT}"
+
+      - name: Load secrets from 1Password
+        id: op
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: false
+        env:
+          APP_PRIVATE_KEY: ${{ secrets.OP_REF_APP_KEY }}
+          DISPATCH_TOKEN: ${{ secrets.OP_REF_APT_DISPATCH_TOKEN }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      - name: Mint a GitHub App token scoped to the target
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.repo }}
+          private-key: ${{ steps.op.outputs.APP_PRIVATE_KEY }}
+
+      - name: Seed APT_DISPATCH_TOKEN secret into the target
+        env:
+          TARGET: ${{ github.event.inputs.target }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DISPATCH_TOKEN: ${{ steps.op.outputs.DISPATCH_TOKEN }}
+        run: |
+          gh secret set APT_DISPATCH_TOKEN --repo "${TARGET}" --body "${DISPATCH_TOKEN}"
+
+      - name: Plant publish-apt-packages workflow into the target
+        env:
+          TARGET: ${{ github.event.inputs.target }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          workflow_path=".github/workflows/publish-apt-packages.yaml"
+          encoded="$(base64 -w0 templates/publish-apt-packages.yaml)"
+          existing_sha="$(gh api "repos/${TARGET}/contents/${workflow_path}" --jq '.sha' 2>/dev/null || true)"
+
+          if [ -n "${existing_sha}" ]; then
+            gh api -X PUT "repos/${TARGET}/contents/${workflow_path}" \
+              -f message="ci: add APT publish-notify workflow (via control plane)" \
+              -f content="${encoded}" \
+              -f sha="${existing_sha}"
+          else
+            gh api -X PUT "repos/${TARGET}/contents/${workflow_path}" \
+              -f message="ci: add APT publish-notify workflow (via control plane)" \
+              -f content="${encoded}"
+          fi
+
+      - name: Onboarding summary
+        env:
+          TARGET: ${{ github.event.inputs.target }}
+        run: |
+          echo "::notice::Onboarded ${TARGET}: seeded APT_DISPATCH_TOKEN and installed .github/workflows/publish-apt-packages.yaml. Its next published release will feed the APT repo."
