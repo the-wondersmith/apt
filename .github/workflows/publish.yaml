@@ -1,0 +1,304 @@
+# yamllint disable rule:line-length
+---
+name: Publish APT repository
+
+# Two entry points, ONE code path:
+#   * workflow_dispatch       -> sign + deploy whatever is in the pool. On day
+#                               zero the pool is empty => bootstrap (signed empty
+#                               Release + pubkey.asc + .nojekyll, so Pages never
+#                               404s). Per-run parameters come from inputs.
+#   * repository_dispatch    -> steady-state ingest: pull a target repo's
+#     (type: publish-deb)       released *.deb into the pool, then the same
+#                               sign + deploy path. Parameters come from
+#                               client_payload.
+#
+# NOTHING sensitive or environment-specific is hard-coded below: per-run knobs
+# are inputs/client_payload, fixed signing config lives in repo *variables*
+# (vars.*), and every sensitive values live in repo *secrets*.
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        default: trixie
+        required: false
+        description: Debian suite/codename
+      component:
+        default: main
+        required: false
+        description: Repository component
+      arches:
+        required: false
+        default: amd64 arm64
+        description: >-
+          Space-separated real architectures (arch:all is added automatically)
+      reason:
+        required: false
+        default: bootstrap or re-sign
+        description: Why is the workflow being run manually? (bootstrap/re-sign/debug)
+
+  repository_dispatch:
+    types:
+      - publish-deb
+
+# Never cancel a publish mid-flight: a cancelled run could leave the durable
+# `pool` branch half-committed or the signed index partially written. Queue.
+concurrency:
+  group: apt-publish
+  cancel-in-progress: false
+
+permissions:
+  pages: write      # deploy to GitHub Pages
+  contents: write   # commit the durable pool branch back
+  id-token: write   # OIDC for actions/deploy-pages
+
+# Per-run parameters: workflow_dispatch input -> repository_dispatch payload ->
+# literal default (needed for the dispatch path, which has no inputs).
+env:
+  SUITE: ${{ github.event.inputs.suite || github.event.client_payload.suite || 'trixie' }}
+  ARCHES: ${{ github.event.inputs.arches || github.event.client_payload.arches || 'amd64 arm64' }}
+  COMPONENT: ${{ github.event.inputs.component || github.event.client_payload.component || 'main' }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout main (workflow + apt-ftparchive.conf)
+        uses: actions/checkout@v4
+
+      - name: Checkout durable pool branch
+        uses: actions/checkout@v4
+        with:
+          ref: pool
+          path: _pool
+
+      - name: Install apt-utils (apt-ftparchive) + gnupg + dpkg-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnupg dpkg-dev apt-utils
+
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@v1
+
+      - id: gpg
+        name: Load signing material into an ephemeral keyring
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Isolated keyring — never touches the runner's default GnuPG home.
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "${GNUPGHOME}"
+          
+          export GNUPGHOME
+          
+          echo "GNUPGHOME=${GNUPGHOME}" >> "${GITHUB_ENV}"
+          echo "allow-loopback-pinentry" > "${GNUPGHOME}/gpg-agent.conf"
+
+          # CI bundle = signing subkeys only, PRIMARY STUBBED (no cert/revoke power).
+          op read "${{ secrets.OP_REF_GPG_SUBKEYS }}" | gpg --batch --import
+          op read "${{ secrets.OP_REF_GPG_PUBKEY }}" > "${RUNNER_TEMP}/pubkey.asc"
+          op read "${{ secrets.OP_REF_GPG_PASSPHRASE }}" > "${RUNNER_TEMP}/pp"
+
+          now="$(date -u +%s)"
+          period_seconds=$(( ${{ vars.ROTATION_PERIOD_DAYS }} * 86400 ))
+
+          # --- Deterministic active / next subkey (no persisted state) ---
+          idx=$(( (now - ${{ vars.SUBKEY_GENESIS_EPOCH }}) / period_seconds ))
+          
+          if [ "$idx" -lt 0 ]; then
+            idx=0
+          fi
+          
+          # shellcheck disable=SC2206
+          subkey_fprs=( ${{ vars.SUBKEY_FPRS }} )
+          subkey_count=${#subkey_fprs[@]}
+          
+          if [ "${idx}" -ge "${subkey_count}" ]; then
+            echo "::error::active index ${idx} >= pre-staged pool (${subkey_count}); keyring refresh overdue"
+            exit 1
+          fi
+          
+          active_fpr="${subkey_fprs[$idx]}"
+          
+          if [ $(( idx + 1 )) -lt "${subkey_count}" ]; then
+            next_fpr="${subkey_fprs[$(( idx + 1 ))]}"
+          else
+            next_fpr="${active_fpr}"
+          fi
+          
+          echo "next_fpr=${next_fpr}" >> "${GITHUB_OUTPUT}"
+          echo "active_fpr=${active_fpr}" >> "${GITHUB_OUTPUT}"
+
+          # --- PUBLISH-TIME HARD FLOOR ---
+          # apt gives clients NO "expires soon" warning — expiry is a silent cliff.
+          # Refuse to publish if the NEWEST still-valid subkey expires < OVERLAP_DAYS out.
+          newest_subkey_expiry=0
+
+          while IFS=: read -r record_type _ _ _ _ _ expiry_epoch _; do
+            if [ "${record_type}" != "sub" ]; then
+              continue
+            fi
+
+            if [ -z "${expiry_epoch}" ]; then
+              continue
+            fi
+
+            if [ "${expiry_epoch}" -gt "${newest_subkey_expiry}" ]; then
+              newest_subkey_expiry="${expiry_epoch}"
+            fi
+          done < <(gpg --with-colons --list-keys "${{ vars.PRIMARY_FPR }}")
+
+          min_required_expiry=$(( now + ${{ vars.OVERLAP_DAYS }} * 86400 ))
+
+          if [ "${newest_subkey_expiry}" -lt "${min_required_expiry}" ]; then
+            echo "::error::newest signing subkey expires in < ${{ vars.OVERLAP_DAYS }}d (exp=${newest_subkey_expiry} min_required_expiry=${min_required_expiry}) — refresh the keyring NOW"
+            exit 1
+          fi
+
+          echo "active=${active_fpr} next=${next_fpr} newest_subkey_expiry=${newest_subkey_expiry}"
+
+      - name: Rehydrate build tree from the durable pool
+        run: |
+          set -euo pipefail
+          
+          mkdir -p site/pool
+          
+          if [ -d _pool/pool ]; then
+            cp -a _pool/pool/. site/pool/
+          fi
+
+          find site/pool -name .gitkeep -delete 2>/dev/null || true
+
+      - name: Ingest released .deb assets into the pool
+        if: github.event_name == 'repository_dispatch'
+        env:
+          # Public targets: the repo's own GITHUB_TOKEN reads public releases.
+          # PRIVATE targets would instead mint an App installation token via
+          # actions/create-github-app-token (app-id in vars.APP_CLIENT_ID, key
+          # from secrets.OP_REF_APP_KEY). Deferred until a private target exists.
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ github.event.client_payload.tag }}
+          TARGET_REPO: ${{ github.event.client_payload.repo }}
+        run: |
+          set -euo pipefail
+          test -n "${TARGET_TAG}"
+          test -n "${TARGET_REPO}"
+          
+          mkdir -p incoming
+          gh release download "${TARGET_TAG}" --repo "${TARGET_REPO}" --pattern '*.deb' --dir incoming
+          
+          shopt -s nullglob
+
+          packages=(incoming/*.deb)
+          
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "::error::no .deb assets on ${TARGET_REPO}@${TARGET_TAG}"
+            exit 1
+          fi
+          
+          for package in "${packages[@]}"; do
+            source_pkg="$(dpkg-deb -f "${package}" Package)"
+            letter="${source_pkg:0:1}"
+            dest="site/pool/${COMPONENT}/${letter}/${source_pkg}"
+            mkdir -p "${dest}"
+            cp -f "${package}" "${dest}/"    # same-filename overwrite == dedup
+            echo "pooled: ${dest}/$(basename "${package}")"
+          done
+
+      - name: Build indices, Release, and dual-sign
+        env:
+          NEXT_FPR: ${{ steps.gpg.outputs.next_fpr }}
+          ACTIVE_FPR: ${{ steps.gpg.outputs.active_fpr }}
+        run: |
+          set -euo pipefail
+          cd site
+
+          # Package indices — arch:all duplicated into binary-all + every real arch.
+          for arch in all $ARCHES; do
+            dist="dists/${SUITE}/${COMPONENT}/binary-${arch}"
+            mkdir -p "${dist}"
+            apt-ftparchive packages pool > "${dist}/Packages"
+            gzip -kf "${dist}/Packages"
+          done
+
+          # Release — static identity from the conf; per-run fields via -o overrides.
+          apt-ftparchive \
+            -c="${GITHUB_WORKSPACE}/apt-ftparchive.conf" \
+            -o APT::FTPArchive::Release::Suite="${SUITE}" \
+            -o APT::FTPArchive::Release::Codename="${SUITE}" \
+            -o APT::FTPArchive::Release::Components="${COMPONENT}" \
+            -o APT::FTPArchive::Release::Architectures="all ${ARCHES}" \
+            release "dists/${SUITE}" > "dists/${SUITE}/Release"
+
+          # Dual-sign (active + next subkey) — belt & suspenders rotation overlap.
+          cd "dists/${SUITE}"
+
+          gpg \
+            --yes \
+            --batch \
+            --clearsign \
+            --pinentry-mode loopback \
+            --passphrase-file "${RUNNER_TEMP}/pp" \
+            -u "${ACTIVE_FPR}!" \
+            -u "${NEXT_FPR}!" \
+            -o InRelease Release
+
+          gpg \
+            --yes \
+            --batch \
+            --pinentry-mode loopback \
+            --passphrase-file "${RUNNER_TEMP}/pp" \
+            -u "${ACTIVE_FPR}!" \
+            -u "${NEXT_FPR}!" \
+            -abs -o Release.gpg Release
+
+      - name: Stage public key + Pages markers
+        run: |
+          set -euo pipefail
+          
+          cp "${RUNNER_TEMP}/pubkey.asc" site/pubkey.asc
+          
+          touch site/.nojekyll
+
+      - name: Persist pool + mirrored public cert back to the pool branch
+        run: |
+          set -euo pipefail
+          
+          rm -rf _pool/pool
+          
+          mkdir -p _pool/pool/main
+          
+          if [ -d site/pool ]; then
+            cp -a site/pool/. _pool/pool/
+          fi
+          
+          touch _pool/pool/main/.gitkeep
+          
+          # Reviewer M4: mirror the public cert into the pool as a resilience backup.
+          cp "${RUNNER_TEMP}/pubkey.asc" _pool/pubkey.asc
+          
+          cd _pool
+
+          git config user.name  "wondersmith-apt-control-plane[bot]"
+          git config user.email "github@wondersmith.dev"
+          git add -A
+          
+          if git diff --cached --quiet; then
+            echo "pool unchanged; nothing to commit"
+          else
+            git commit -m "pool: publish ${{ github.event.client_payload.tag || 'bootstrap' }} (${{ github.event.client_payload.repo || 'manual' }})"
+            git push origin HEAD:pool
+          fi
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

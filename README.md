@@ -4,8 +4,12 @@ A GPG-signed [Debian APT repository](https://the-wondersmith.github.io/apt) serv
 via GitHub Pages, plus the **control plane** that onboards and feeds package repos
 into it.
 
-- **Distribution:** `trixie` (Debian 13 / Proxmox VE 9) · **Component:** `main` · **Arch:** `all`
-- **Install:** see [Installation](#installation) below.
+|                  |                                         |
+|:-----------------|:---------------------------------------:|
+| **Distribution** |          `trixie` (Debian 13)           |
+| **Component**    |                 `main`                  |
+| **Arch**         |                  `all`                  |
+| **Install**      | see [Installation](#installation) below |
 
 This repository does two jobs:
 
@@ -13,15 +17,15 @@ This repository does two jobs:
    durable package **pool** (the `pool` branch), signed with an automatically
    rotated GPG signing subkey and deployed to GitHub Pages.
 2. **Control plane.** A GitHub App + workflows that onboard other repositories
-   (seed a dispatch credential, plant a release-notify workflow) so that when a
+   (seed a dispatch credential, install a release-notify workflow) so that when a
    target repo publishes a release, its `.deb` assets are pulled in, re-indexed,
    re-signed, and republished — with zero manual steps.
 
 ## Repository layout
 
-| Branch | Purpose |
-| ------ | ------- |
-| `main` | Control-plane + publish workflows, `apt-ftparchive.conf`, docs. |
+| Branch | Purpose                                                                |
+|--------|------------------------------------------------------------------------|
+| `main` | Control-plane + publish workflows, `apt-ftparchive.conf`, docs.        |
 | `pool` | Durable package pool (source of truth) + mirrored public signing cert. |
 
 The published Pages site (`gh-pages`-style artifact, built by Actions) is generated
