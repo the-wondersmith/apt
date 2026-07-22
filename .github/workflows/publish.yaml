@@ -264,6 +264,29 @@ jobs:
           
           touch site/.nojekyll
 
+      - name: Build bootstrap tarball
+        run: |
+          set -euo pipefail
+
+          root="$(mktemp -d)"
+
+          install -d -m 0755 "${root}/usr/share/keyrings" "${root}/etc/apt/sources.list.d"
+
+          # dearmor the published cert into a binary keyring apt consumes via `signed-by`
+          gpg --dearmor < site/pubkey.asc > "${root}/usr/share/keyrings/wondersmith-apt.gpg"
+          chmod 0644 "${root}/usr/share/keyrings/wondersmith-apt.gpg"
+          
+          {
+            printf 'deb [signed-by=/usr/share/keyrings/wondersmith-apt.gpg] ';
+            printf 'https://the-wondersmith.github.io/apt %s %s\n' "${SUITE}" "${COMPONENT}";
+          } > "${root}/etc/apt/sources.list.d/wondersmith.list"
+
+          chmod 0644 "${root}/etc/apt/sources.list.d/wondersmith.list"
+
+          tar -C "${root}" --owner=0 --group=0 --numeric-owner -czf site/bootstrap.tgz usr etc
+
+          rm -rf "${root}"
+
       - name: Persist pool + mirrored public cert back to the pool branch
         run: |
           set -euo pipefail
