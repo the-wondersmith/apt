@@ -130,8 +130,11 @@ jobs:
             next_fpr="${active_fpr}"
           fi
           
-          echo "next_fpr=${next_fpr}" >> "${GITHUB_OUTPUT}"
-          echo "active_fpr=${active_fpr}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "next_fpr=${next_fpr}"
+            echo "active_idx=${idx}"
+            echo "active_fpr=${active_fpr}"
+          } >> "${GITHUB_OUTPUT}"
 
           # --- PUBLISH-TIME HARD FLOOR ---
           # apt gives clients NO "expires soon" warning — expiry is a silent cliff.
@@ -208,6 +211,18 @@ jobs:
             cp -f "${package}" "${dest}/"    # same-filename overwrite == dedup
             echo "pooled: ${dest}/$(basename "${package}")"
           done
+
+      - name: Build repository keyring package into the pool
+        # Optional archive-keyring package: ships the dearmored signing cert so
+        # installed clients receive rotations via `apt upgrade`. Built BEFORE the
+        # indices, so it is indexed + signed like any other pooled package. The
+        # bootstrap tarball (below) is unaffected and never depends on it.
+        uses: ./.github/actions/build-keyring-deb
+        with:
+          pubkey-path: ${{ runner.temp }}/pubkey.asc
+          active-idx: ${{ steps.gpg.outputs.active_idx }}
+          pool-dir: site/pool
+          component: ${{ env.COMPONENT }}
 
       - name: Build indices, Release, and dual-sign
         env:

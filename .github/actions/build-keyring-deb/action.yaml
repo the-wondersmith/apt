@@ -1,0 +1,112 @@
+---
+name: Build repository keyring package
+description: >-
+  Build the optional `wondersmith-apt-keyring` Debian package that ships the
+  dearmored repository signing cert to `/usr/share/keyrings/wondersmith-apt.gpg`.
+  Installed clients that pull this package receive rotated signing certs
+  transparently via `apt upgrade`. First-install (bootstrap.tgz) stays fully
+  standalone and never depends on this package.
+
+inputs:
+  pool-dir:
+    required: true
+    description: >-
+      Path to the pool root (e.g. `site/pool`). The built .deb is dropped into
+      `<pool-dir>/<component>/w/wondersmith-apt-keyring/`.
+  component:
+    required: false
+    default: main
+    description: Repository component (pool subdirectory).
+  active-idx:
+    required: true
+    description: >-
+      Deterministic active signing-subkey rotation index. Baked into the package
+      version so a key rotation always advances the version and reaches clients.
+  pubkey-path:
+    required: true
+    description: Path to the ARMORED public cert (pubkey.asc) to dearmor and ship.
+
+outputs:
+  version:
+    value: ${{ steps.build.outputs.version }}
+    description: The computed package version (1.<active-idx>.<YYYYMMDD>).
+  deb-path:
+    value: ${{ steps.build.outputs.deb_path }}
+    description: Path to the built .deb inside the pool.
+
+runs:
+  using: composite
+  steps:
+    - id: build
+      shell: bash
+      env:
+        POOL_DIR: ${{ inputs.pool-dir }}
+        COMPONENT: ${{ inputs.component }}
+        ACTIVE_IDX: ${{ inputs.active-idx }}
+        PUBKEY_PATH: ${{ inputs.pubkey-path }}
+      run: |
+        set -euo pipefail
+
+        test -f "${PUBKEY_PATH}"
+        test -n "${ACTIVE_IDX}"
+        test -n "${POOL_DIR}"
+
+        # Version: rotation index + build date. A cert rotation advances
+        # ACTIVE_IDX (hence the version); the date component keeps re-publishes
+        # on later days monotonic. apt therefore always converges to the newest
+        # cert on `apt upgrade`.
+        version="1.${ACTIVE_IDX}.$(date -u +%Y%m%d)"
+
+        # Assemble the package staging tree.
+        stage="$(mktemp -d)"
+        install -d -m 0755 "${stage}/DEBIAN" "${stage}/usr/share/keyrings"
+
+        # Dearmor the armored cert into the exact binary keyring apt consumes
+        # via `signed-by=` — identical path & bytes to what bootstrap.tgz ships,
+        # so ownership of the file can pass to dpkg without breaking trust.
+        gpg --dearmor < "${PUBKEY_PATH}" > "${stage}/usr/share/keyrings/wondersmith-apt.gpg"
+        chmod 0644 "${stage}/usr/share/keyrings/wondersmith-apt.gpg"
+
+        # md5sums for the shipped conffile-free data.
+        (
+          cd "${stage}"
+          find usr -type f -print0 \
+            | xargs -0 md5sum \
+            | sed 's#  #  #' > DEBIAN/md5sums
+        )
+        chmod 0644 "${stage}/DEBIAN/md5sums"
+
+        cat > "${stage}/DEBIAN/control" <<CONTROL
+        Package: wondersmith-apt-keyring
+        Version: ${version}
+        Architecture: all
+        Maintainer: Mark S. <the@wondersmith.dev>
+        Section: misc
+        Priority: optional
+        Installed-Size: 8
+        Description: Wondersmith APT repository signing keyring
+         Ships the dearmored Wondersmith APT repository signing certificate to
+         /usr/share/keyrings/wondersmith-apt.gpg. This package is OPTIONAL: the
+         one-line bootstrap install already drops the key and apt source and does
+         not depend on it. Install this package to have the signing key managed by
+         dpkg, so automatic signing-key rotations reach this machine transparently
+         via \`apt upgrade\`.
+        CONTROL
+
+        chmod 0644 "${stage}/DEBIAN/control"
+
+        # Build into the pool, mirroring the layout the ingest path uses:
+        #   <pool>/<component>/<first-letter>/<package>/<file>.deb
+        dest="${POOL_DIR}/${COMPONENT}/w/wondersmith-apt-keyring"
+
+        mkdir -p "${dest}"
+
+        deb_path="${dest}/wondersmith-apt-keyring_${version}_all.deb"
+
+        dpkg-deb --root-owner-group --build "${stage}" "${deb_path}"
+
+        rm -rf "${stage}"
+
+        echo "version=${version}" >> "${GITHUB_OUTPUT}"
+        echo "deb_path=${deb_path}" >> "${GITHUB_OUTPUT}"
+        echo "built ${deb_path}"
