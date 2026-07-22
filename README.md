@@ -33,8 +33,29 @@ from `pool` at publish time — it is **not** committed here.
 
 ## Installation
 
-> Bootstrapping in progress — install instructions will be finalized once the
-> day-zero publish lands.
+One command drops the signing keyring and an apt source into place:
+
+```sh
+curl -fsSL 'https://the-wondersmith.github.io/apt/bootstrap.tgz' \
+| sudo tar -C / -xzf - \
+&& sudo apt update
+```
+
+The bootstrap archive unpacks (rooted at `/`) to:
+
+- `/usr/share/keyrings/wondersmith-apt.gpg` — the dearmored repository signing key
+- `/etc/apt/sources.list.d/wondersmith.list` —
+  `deb [signed-by=/usr/share/keyrings/wondersmith-apt.gpg] https://the-wondersmith.github.io/apt trixie main`
+
+Prefer to wire it up by hand? The equivalent manual steps:
+
+```sh
+curl -fsSL https://the-wondersmith.github.io/apt/pubkey.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/wondersmith-apt.gpg
+echo 'deb [signed-by=/usr/share/keyrings/wondersmith-apt.gpg] https://the-wondersmith.github.io/apt trixie main' \
+  | sudo tee /etc/apt/sources.list.d/wondersmith.list
+sudo apt update
+```
 
 ## Signing key
 
