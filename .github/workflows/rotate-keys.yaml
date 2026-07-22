@@ -55,6 +55,13 @@ jobs:
 
       - name: Install `op` CLI
         uses: 1password/install-cli-action@v4
+        with:
+          # Pin to the newest stable release downloadable from
+          # cache.agilebits.com (2.36-2.38 are 404/beta-only). Avoids the
+          # floating `latest` default silently shifting the runner's op version.
+          # 2.35.0 has an `op item edit` stdin bug, already mitigated by the
+          # `</dev/null` redirect on this workflow's write step.
+          version: 2.38.0
 
       - id: gpg
         name: Load signing subkeys into an ephemeral keyring

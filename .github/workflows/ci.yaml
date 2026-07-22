@@ -1,0 +1,39 @@
+---
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "**.yml"
+      - "**.yaml"
+      - ".github/**"
+  pull_request:
+    paths:
+      - "**.yml"
+      - "**.yaml"
+      - ".github/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Run yamllint
+        run: |
+          pipx run yamllint --strict .
+
+      - name: Run actionlint
+        uses: raven-actions/actionlint@v2

@@ -71,8 +71,7 @@ runs:
         (
           cd "${stage}"
           find usr -type f -print0 \
-            | xargs -0 md5sum \
-            | sed 's#  #  #' > DEBIAN/md5sums
+            | xargs -0 md5sum > DEBIAN/md5sums
         )
         chmod 0644 "${stage}/DEBIAN/md5sums"
 

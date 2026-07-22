@@ -81,6 +81,12 @@ jobs:
 
       - name: Install 1Password CLI
         uses: 1password/install-cli-action@v4
+        with:
+          # Pin to the newest stable release downloadable from
+          # cache.agilebits.com. publish only READS via op, so the 2.35.0
+          # `op item edit` stdin bug does not apply here; pinning keeps the
+          # runtime reproducible.
+          version: 2.38.0
 
       - id: gpg
         name: Load signing material into an ephemeral keyring
@@ -223,6 +229,55 @@ jobs:
 
           find site/pool -name .gitkeep -delete 2>/dev/null || true
 
+      - name: Verify durable pool integrity against its committed manifest
+        env:
+          ACTIVE_FPR: ${{ steps.gpg.outputs.active_fpr }}
+        run: |
+          set -euo pipefail
+
+          # Ensure the provenance dir always exists so the reverse-check `find`
+          # below is well-defined even on the first run.
+          mkdir -p _pool/provenance
+
+          manifest="_pool/pool.sha256"
+          signature="_pool/pool.sha256.asc"
+
+          # First-run / bootstrap tolerance: no manifest yet means there is
+          # nothing to verify. This run will establish the first signed
+          # manifest in the Persist step below.
+          if [ ! -f "${manifest}" ] && [ ! -f "${signature}" ]; then
+            echo "::notice::no pool manifest present yet; establishing it this run"
+          else
+            if [ ! -f "${manifest}" ] || [ ! -f "${signature}" ]; then
+              echo "::error::pool manifest or its signature is missing (manifest=${manifest} signature=${signature})"
+              exit 1
+            fi
+
+            # 1. The signature must verify against a key already imported into
+            #    the ephemeral GNUPGHOME (offline primary + its signing subkeys).
+            if ! gpg --verify "${signature}" "${manifest}"; then
+              echo "::error::pool manifest signature verification failed"
+              exit 1
+            fi
+
+            # 2. Every hash recorded in the manifest must still match on disk.
+            if ! ( cd _pool && LC_ALL=C sha256sum --quiet --strict -c pool.sha256 ); then
+              echo "::error::pool manifest checksum verification failed"
+              exit 1
+            fi
+
+            # 3. Reverse check: no file may exist on disk that the manifest
+            #    does not account for (catches out-of-band injection).
+            actual_files="$(cd _pool && find pool provenance -type f ! -name .gitkeep | LC_ALL=C sort)"
+            manifest_files="$(awk '{ sub(/^[^ ]+ [ *]/, ""); print }' _pool/pool.sha256 | LC_ALL=C sort)"
+            if [ "${actual_files}" != "${manifest_files}" ]; then
+              echo "::error::pool contains files not present in the signed manifest (possible out-of-band injection)"
+              exit 1
+            fi
+
+            echo "pool integrity verified against signed manifest"
+          fi
+
       - name: Ingest released .deb assets into the pool
         if: github.event_name == 'repository_dispatch'
         env:
@@ -250,13 +305,78 @@ jobs:
             exit 1
           fi
           
+          # --- Provenance verification (Tier-2 hardening) ---
+          # Reject anything that is not a published, attested asset of the exact
+          # release named in the dispatch. Runs BEFORE the arch floor and pooling
+          # so unverified bytes never enter the pool.
+
+          # (1) The release must exist and be published (not a draft). A missing
+          #     tag makes `gh api` non-zero, which set -e turns into a failure.
+          release_json="$(gh api "repos/${TARGET_REPO}/releases/tags/${TARGET_TAG}")"
+          is_draft="$(jq -r '.draft' <<<"${release_json}")"
+          if [ "${is_draft}" != "false" ]; then
+            echo "::error::${TARGET_REPO}@${TARGET_TAG} is a draft or missing (draft=${is_draft})"
+            exit 1
+          fi
+
+          # (2) Every downloaded .deb must actually be an asset of that release.
+          release_asset_names="$(jq -r '.assets[].name' <<<"${release_json}")"
           for package in "${packages[@]}"; do
-            source_pkg="$(dpkg-deb -f "${package}" Package)"
-            letter="${source_pkg:0:1}"
-            dest="site/pool/${COMPONENT}/${letter}/${source_pkg}"
+            asset_name="$(basename "${package}")"
+            if ! grep -Fxq "${asset_name}" <<<"${release_asset_names}"; then
+              echo "::error::${asset_name} is not an asset of ${TARGET_REPO}@${TARGET_TAG}"
+              exit 1
+            fi
+          done
+
+          # (3) Every .deb must carry a valid SLSA build-provenance attestation
+          #     whose signer identity is the target repo. Only the signing
+          #     certificate identity is un-forgeable, so we pin --signer-repo and
+          #     never assert on predicate contents.
+          for package in "${packages[@]}"; do
+            if ! gh attestation verify "${package}" --repo "${TARGET_REPO}" --signer-repo "${TARGET_REPO}"; then
+              echo "::error::provenance attestation failed for $(basename "${package}") from ${TARGET_REPO}"
+              exit 1
+            fi
+          done
+          # --- end provenance verification ---
+          
+          # Validate the arch floor BEFORE pooling anything (no partial ingest):
+          # each package name must be a single Architecture:all build OR provide
+          # BOTH amd64 AND arm64 (extra arches allowed).
+          declare -A arches_by_package
+          for package in "${packages[@]}"; do
+            package_name="$(dpkg-deb -f "${package}" Package)"
+            package_arch="$(dpkg-deb -f "${package}" Architecture)"
+            arches_by_package["${package_name}"]="${arches_by_package[${package_name}]:-} ${package_arch}"
+          done
+
+          for package_name in "${!arches_by_package[@]}"; do
+            arches="${arches_by_package[${package_name}]}"
+            found_all=0; found_amd64=0; found_arm64=0
+            for arch in ${arches}; do
+              case "${arch}" in
+                all)   found_all=1 ;;
+                amd64) found_amd64=1 ;;
+                arm64) found_arm64=1 ;;
+              esac
+            done
+            if [ "${found_all}" -eq 0 ] && { [ "${found_amd64}" -eq 0 ] || [ "${found_arm64}" -eq 0 ]; }; then
+              echo "::error::${package_name} violates arch floor (has:${arches}); need 'all' or both amd64+arm64"
+              exit 1
+            fi
+          done
+
+          # Pool every asset (same-filename overwrite == dedup).
+          for package in "${packages[@]}"; do
+            package_name="$(dpkg-deb -f "${package}" Package)"
+            pool_letter="${package_name:0:1}"
+            dest="site/pool/${COMPONENT}/${pool_letter}/${package_name}"
             mkdir -p "${dest}"
-            cp -f "${package}" "${dest}/"    # same-filename overwrite == dedup
+            cp -f "${package}" "${dest}/"
             echo "pooled: ${dest}/$(basename "${package}")"
+            # Record the pooled digest for this run's provenance record.
+            sha256sum "${dest}/$(basename "${package}")" >> "${RUNNER_TEMP}/ingested.sha256"
           done
 
       - name: Build repository keyring package into the pool
@@ -279,11 +399,26 @@ jobs:
           set -euo pipefail
           cd site
 
-          # Package indices — arch:all duplicated into binary-all + every real arch.
+          # Package indices — split the single scan by Architecture stanza:
+          # arch:all goes into binary-all AND every real arch; a real-arch build
+          # goes only into its own binary-<arch> index.
+          apt-ftparchive packages pool > /tmp/Packages.full
           for arch in all $ARCHES; do
             dist="dists/${SUITE}/${COMPONENT}/binary-${arch}"
             mkdir -p "${dist}"
-            apt-ftparchive packages pool > "${dist}/Packages"
+            awk -v target_arch="${arch}" '
+              BEGIN { RS=""; FS="\n" }
+              {
+                stanza_arch=""
+                for (line=1; line<=NF; line++)
+                  if ($line ~ /^Architecture: /) stanza_arch=substr($line, 15)
+                if (target_arch == "all") {
+                  if (stanza_arch == "all") print $0 "\n"
+                } else if (stanza_arch == "all" || stanza_arch == target_arch) {
+                  print $0 "\n"
+                }
+              }
+            ' /tmp/Packages.full > "${dist}/Packages"
             gzip -kf "${dist}/Packages"
           done
 
@@ -349,7 +484,49 @@ jobs:
 
           rm -rf "${root}"
 
+      - name: Write signed provenance record
+        env:
+          ACTIVE_FPR: ${{ steps.gpg.outputs.active_fpr }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p _pool/provenance
+          record="_pool/provenance/${GITHUB_RUN_ID}.txt"
+
+          # Append-only, run-keyed audit record of what this run ingested and
+          # signed. Committed to the pool branch and detach-signed with the active
+          # subkey; also covered by the signed pool manifest (Diff B) and echoed
+          # to the job summary for human auditing.
+          {
+            printf 'timestamp:   %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf 'run:         %s\n' "${GITHUB_RUN_ID}"
+            printf 'run_url:     %s/%s/actions/runs/%s\n' \
+              "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
+            printf 'dispatcher:  %s\n' "${GITHUB_ACTOR}"
+            printf 'event:       %s\n' "${GITHUB_EVENT_NAME}"
+            printf 'source_repo: %s\n' "${{ github.event.client_payload.repo || 'manual' }}"
+            printf 'source_tag:  %s\n' "${{ github.event.client_payload.tag || 'bootstrap' }}"
+            printf 'active_fpr:  %s\n' "${ACTIVE_FPR}"
+            printf 'assets:\n'
+            if [ -f "${RUNNER_TEMP}/ingested.sha256" ]; then
+              sed 's#^#  #' "${RUNNER_TEMP}/ingested.sha256"
+            else
+              printf '  none (re-sign / bootstrap; no assets ingested)\n'
+            fi
+          } > "${record}"
+
+          gpg --yes --batch --pinentry-mode loopback \
+            --passphrase-file "${RUNNER_TEMP}/pp" \
+            -u "${ACTIVE_FPR}!" \
+            --detach-sign --armor \
+            -o "${record}.asc" "${record}"
+
+          cat "${record}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "::notice::provenance recorded for run ${GITHUB_RUN_ID}"
+
       - name: Persist pool + mirrored public cert back to the pool branch
+        env:
+          ACTIVE_FPR: ${{ steps.gpg.outputs.active_fpr }}
         run: |
           set -euo pipefail
           
@@ -365,6 +542,16 @@ jobs:
           
           # Reviewer M4: mirror the public cert into the pool as a resilience backup.
           cp "${RUNNER_TEMP}/pubkey.asc" _pool/pubkey.asc
+
+          # Regenerate the pool manifest over the final contents (pool packages +
+          # provenance records) and sign it with the active subkey. The next run
+          # verifies this before trusting the pool.
+          ( cd _pool && find pool provenance -type f ! -name .gitkeep | LC_ALL=C sort | xargs -r sha256sum > pool.sha256 )
+          gpg --yes --batch --pinentry-mode loopback \
+            --passphrase-file "${RUNNER_TEMP}/pp" \
+            -u "${ACTIVE_FPR}!" \
+            --detach-sign --armor \
+            -o _pool/pool.sha256.asc _pool/pool.sha256
           
           cd _pool
 
