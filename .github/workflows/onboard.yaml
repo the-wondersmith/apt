@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out control-plane repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - id: target
         name: Parse target repository
@@ -53,7 +53,7 @@ jobs:
 
       - name: Load secrets from 1Password
         id: op
-        uses: 1password/load-secrets-action@v4
+        uses: 1password/load-secrets-action@3a12b0ab99d9cd590a3e9b5a90ea017210ed9556  # v4
         with:
           export-env: false
         env:
@@ -63,7 +63,7 @@ jobs:
 
       - name: Mint a GitHub App token scoped to the target
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
         with:
           client-id: ${{ vars.APP_CLIENT_ID }}
           owner: ${{ steps.target.outputs.owner }}

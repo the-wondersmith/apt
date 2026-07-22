@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out control-plane repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Install GnuPG
         run: |
@@ -54,7 +54,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends gnupg
 
       - name: Install `op` CLI
-        uses: 1password/install-cli-action@v4
+        uses: 1password/install-cli-action@a5215d3a7f75c1629216c465ea9ab3ab399c4b71  # v4
         with:
           # Pin to the newest stable release downloadable from
           # cache.agilebits.com (2.36-2.38 are 404/beta-only). Avoids the
