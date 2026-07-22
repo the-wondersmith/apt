@@ -85,6 +85,8 @@ jobs:
       - id: gpg
         name: Load signing material into an ephemeral keyring
         env:
+          OP_VAULT: ${{ secrets.OP_VAULT }}
+          OP_ITEM: ${{ secrets.OP_GPG_ITEM }}
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
         run: |
           set -euo pipefail
@@ -92,9 +94,9 @@ jobs:
           # Isolated keyring — never touches the runner's default GnuPG home.
           GNUPGHOME="$(mktemp -d)"
           chmod 700 "${GNUPGHOME}"
-          
+
           export GNUPGHOME
-          
+
           echo "GNUPGHOME=${GNUPGHOME}" >> "${GITHUB_ENV}"
           echo "allow-loopback-pinentry" > "${GNUPGHOME}/gpg-agent.conf"
 
@@ -104,35 +106,80 @@ jobs:
           op read "${{ secrets.OP_REF_GPG_PASSPHRASE }}" > "${RUNNER_TEMP}/pp"
 
           now="$(date -u +%s)"
-          period_seconds=$(( ${{ vars.ROTATION_PERIOD_DAYS }} * 86400 ))
 
-          # --- Deterministic active / next subkey (no persisted state) ---
-          idx=$(( (now - ${{ vars.SUBKEY_GENESIS_EPOCH }}) / period_seconds ))
-          
-          if [ "$idx" -lt 0 ]; then
-            idx=0
-          fi
-          
-          # shellcheck disable=SC2206
-          subkey_fprs=( ${{ vars.SUBKEY_FPRS }} )
-          subkey_count=${#subkey_fprs[@]}
-          
-          if [ "${idx}" -ge "${subkey_count}" ]; then
-            echo "::error::active index ${idx} >= pre-staged pool (${subkey_count}); keyring refresh overdue"
+          # --- Active / next signers are stored, NOT computed here ---
+          # The `rotate-keys` workflow owns the schedule math and writes the authoritative
+          # `active_fpr`/`next_fpr`/`fpr_idx` named fields. Publish reads them directly and
+          # cross-checks them against the `gpg_subkey_fpr_N` table so a stale or corrupt
+          # rotation can never sign with the wrong key.
+          state_json="$(
+            op item get "${OP_ITEM}" \
+              --format json \
+              --vault "${OP_VAULT}" \
+              --fields label=fpr_idx \
+              --fields label=next_fpr \
+              --fields label=active_fpr \
+              --fields label=gpg_subkey_fpr_0 \
+              --fields label=gpg_subkey_fpr_1 \
+              --fields label=gpg_subkey_fpr_2 \
+              --fields label=gpg_subkey_fpr_3 \
+              --fields label=gpg_subkey_fpr_4 \
+              --fields label=gpg_subkey_fpr_5 \
+              --fields label=gpg_subkey_fpr_6 \
+              --fields label=gpg_subkey_fpr_7
+          )"
+
+          # Pull the three rotation-state fields by label.
+          next_fpr="$(jq -r '.[]  | select(.label == "next_fpr")   | .value' <<< "${state_json}")"
+          active_idx="$(jq -r '.[] | select(.label == "fpr_idx")    | .value' <<< "${state_json}")"
+          active_fpr="$(jq -r '.[] | select(.label == "active_fpr") | .value' <<< "${state_json}")"
+
+          # Fail loudly on empty / unseeded state (rotate-keys.yaml must run first).
+          for field in active_fpr next_fpr active_idx; do
+            value="${!field}"
+            if [ -z "${value}" ] || [ "${value}" = "null" ] || [ "${value}" = "PENDING_ROTATION" ]; then
+              echo "::error::1Password field for ${field} is empty/unseeded (${value:-<empty>}) — run rotate-keys.yaml before publishing"
+              exit 1
+            fi
+          done
+
+          # active_idx must be a plain integer within the pre-staged pool.
+          if ! [[ "${active_idx}" =~ ^[0-9]+$ ]]; then
+            echo "::error::fpr_idx is not an integer: '${active_idx}'"
             exit 1
           fi
-          
-          active_fpr="${subkey_fprs[$idx]}"
-          
-          if [ $(( idx + 1 )) -lt "${subkey_count}" ]; then
-            next_fpr="${subkey_fprs[$(( idx + 1 ))]}"
-          else
-            next_fpr="${active_fpr}"
+
+          # Cross-check: the stored active/next fprs MUST match the authoritative
+          # table at fpr_idx and fpr_idx+1. Guards against a desynced rotation.
+          expected_active="$(jq -r --arg i "${active_idx}" '.[] | select(.label == "gpg_subkey_fpr_" + $i) | .value' <<< "${state_json}")"
+          expected_next="$(jq -r --arg i "$(( active_idx + 1 ))" '.[] | select(.label == "gpg_subkey_fpr_" + $i) | .value' <<< "${state_json}")"
+
+          if [ -z "${expected_active}" ] || [ "${expected_active}" = "null" ]; then
+            echo "::error::no gpg_subkey_fpr_${active_idx} in 1Password — fpr_idx out of range for the staged pool"
+            exit 1
           fi
-          
+
+          if [ "${active_fpr}" != "${expected_active}" ]; then
+            echo "::error::active_fpr does not match gpg_subkey_fpr_${active_idx} — rotation state is desynced (inspect 1Password item)"
+            exit 1
+          fi
+
+          # next_fpr equals the following subkey, or the active one at pool end.
+          if [ -n "${expected_next}" ] && [ "${expected_next}" != "null" ]; then
+            if [ "${next_fpr}" != "${expected_next}" ]; then
+              echo "::error::next_fpr does not match gpg_subkey_fpr_$(( active_idx + 1 )) — rotation state is desynced (inspect 1Password item)"
+              exit 1
+            fi
+          else
+            if [ "${next_fpr}" != "${active_fpr}" ]; then
+              echo "::error::at pool end next_fpr must equal active_fpr — rotation state is desynced (inspect 1Password item)"
+              exit 1
+            fi
+          fi
+
           {
             echo "next_fpr=${next_fpr}"
-            echo "active_idx=${idx}"
+            echo "active_idx=${active_idx}"
             echo "active_fpr=${active_fpr}"
           } >> "${GITHUB_OUTPUT}"
 
@@ -162,7 +209,7 @@ jobs:
             exit 1
           fi
 
-          echo "active=${active_fpr} next=${next_fpr} newest_subkey_expiry=${newest_subkey_expiry}"
+          echo "signing keys validated; newest_subkey_expiry=${newest_subkey_expiry}"
 
       - name: Rehydrate build tree from the durable pool
         run: |
@@ -219,10 +266,10 @@ jobs:
         # bootstrap tarball (below) is unaffected and never depends on it.
         uses: ./.github/actions/build-keyring-deb
         with:
-          pubkey-path: ${{ runner.temp }}/pubkey.asc
-          active-idx: ${{ steps.gpg.outputs.active_idx }}
           pool-dir: site/pool
           component: ${{ env.COMPONENT }}
+          pubkey-path: ${{ runner.temp }}/pubkey.asc
+          active-idx: ${{ steps.gpg.outputs.active_idx }}
 
       - name: Build indices, Release, and dual-sign
         env:

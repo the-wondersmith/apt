@@ -1,0 +1,239 @@
+# yamllint disable rule:line-length
+---
+name: Rotate signing keys
+
+# Standalone key rotation logic. The `publish` workflow computes nothing about which
+# subkeys to sign with — it just reads the two fingerprints this workflow writes
+# into secrets and fails loudly if they are missing or expiring. Here we:
+#
+#   1. Load the signing subkeys (subkeys-only bundle; primary stays offline) into
+#      an ephemeral keyring.
+#   2. Deterministically compute the active + next signing subkey from the
+#      genesis epoch and rotation period (no persisted counter to drift).
+#   3. Guard loudly (a failed run is the alert — GitHub emails on failure):
+#        * GUARD A: newest subkey expires inside the floor + lead window.
+#        * GUARD B: the pre-staged subkey pool is nearly exhausted.
+#   4. Write the two fingerprints to secrets (single source of truth).
+#   5. Auto-republish so the new active/next pair (and the refreshed keyring
+#      package version) reach clients promptly, not at the next release.
+#
+# Cadence: monthly. Rotation period is 90d, so monthly is ample lead time and
+# keeps runner minutes near zero.
+
+on:
+  schedule:
+    # yamllint disable-line rule:quoted-strings
+    - cron: '0 3 1 * *'  # 03:00 UTC on the 1st of each month
+  workflow_dispatch:
+    inputs:
+      reason:
+        required: false
+        default: manual rotation check
+        description: Why is the rotation workflow being run manually?
+
+# Rotation writes the shared signing-key secret; never overlap runs.
+concurrency:
+  group: apt-rotate-keys
+  cancel-in-progress: false
+
+permissions:
+  actions: write   # dispatch the `publish` workflow (auto-republish)
+  contents: read
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out control-plane repo
+        uses: actions/checkout@v7
+
+      - name: Install GnuPG
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnupg
+
+      - name: Install `op` CLI
+        uses: 1password/install-cli-action@v4
+
+      - id: gpg
+        name: Load signing subkeys into an ephemeral keyring
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Isolated keyring — never touches the runner's default GnuPG home.
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "${GNUPGHOME}"
+          export GNUPGHOME
+          echo "GNUPGHOME=${GNUPGHOME}" >> "${GITHUB_ENV}"
+          echo "allow-loopback-pinentry" > "${GNUPGHOME}/gpg-agent.conf"
+
+          # CI bundle = signing subkeys only, PRIMARY STUBBED (no cert/revoke power).
+          op read "${{ secrets.OP_REF_GPG_SUBKEYS }}" | gpg --batch --import
+
+      - id: compute
+        name: Compute active + next signing subkey
+        env:
+          OP_VAULT: ${{ secrets.OP_VAULT }}
+          OP_ITEM: ${{ secrets.OP_GPG_ITEM }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          now="$(date -u +%s)"
+          period_seconds=$(( ${{ vars.ROTATION_PERIOD_DAYS }} * 86400 ))
+
+          # Deterministic rotation index from the genesis epoch — no persisted
+          # counter, so nothing can drift out of sync.
+          idx=$(( (now - ${{ vars.SUBKEY_GENESIS_EPOCH }}) / period_seconds ))
+
+          if [ "${idx}" -lt 0 ]; then
+            idx=0
+          fi
+
+          # Authoritative subkey table lives in secrets as named fields
+          # gpg_subkey_fpr_0 .. gpg_subkey_fpr_7. Pull them all in one call, then
+          # look each value up BY LABEL — never by positional order (op/jq field
+          # ordering is not a contract we should depend on).
+          state_json="$(
+            op item get "${OP_ITEM}" \
+              --format json \
+              --vault "${OP_VAULT}" \
+              --fields label=gpg_subkey_fpr_0 \
+              --fields label=gpg_subkey_fpr_1 \
+              --fields label=gpg_subkey_fpr_2 \
+              --fields label=gpg_subkey_fpr_3 \
+              --fields label=gpg_subkey_fpr_4 \
+              --fields label=gpg_subkey_fpr_5 \
+              --fields label=gpg_subkey_fpr_6 \
+              --fields label=gpg_subkey_fpr_7
+          )"
+
+          # Count populated subkey fields by matching their labels (order-agnostic).
+          subkey_count="$(jq '[.[] | select(.label | startswith("gpg_subkey_fpr_")) | select(.value != null and .value != "")] | length' <<< "${state_json}")"
+
+          if [ "${idx}" -ge "${subkey_count}" ]; then
+            echo "::error::active index ${idx} >= pre-staged pool (${subkey_count}); the subkey pool is EXHAUSTED. Follow docs/KEY-ROTATION.md to mint a fresh pool."
+            exit 1
+          fi
+
+          # Select active + next fingerprints by their explicit labels.
+          active_fpr="$(jq -r --arg i "${idx}" '.[] | select(.label == "gpg_subkey_fpr_" + $i) | .value' <<< "${state_json}")"
+
+          if [ $(( idx + 1 )) -lt "${subkey_count}" ]; then
+            next_fpr="$(jq -r --arg i "$(( idx + 1 ))" '.[] | select(.label == "gpg_subkey_fpr_" + $i) | .value' <<< "${state_json}")"
+          else
+            next_fpr="${active_fpr}"
+          fi
+
+          if [ -z "${active_fpr}" ] || [ "${active_fpr}" = "null" ]; then
+            echo "::error::gpg_subkey_fpr_${idx} is empty in secrets — subkey table is incomplete"
+            exit 1
+          fi
+
+          {
+            echo "active_idx=${idx}"
+            echo "next_fpr=${next_fpr}"
+            echo "active_fpr=${active_fpr}"
+            echo "subkey_count=${subkey_count}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "::notice::computed active/next signing subkeys for idx=${idx} (fingerprints written to 1Password)"
+
+      - name: Guard A — refuse if the newest subkey is expiring soon
+        env:
+          ACTIVE_FPR: ${{ steps.compute.outputs.active_fpr }}
+        run: |
+          set -euo pipefail
+
+          now="$(date -u +%s)"
+
+          # Find the newest still-valid subkey expiry in the ephemeral keyring.
+          newest_subkey_expiry=0
+
+          while IFS=: read -r record_type _ _ _ _ _ expiry_epoch _; do
+            if [ "${record_type}" != "sub" ]; then
+              continue
+            fi
+            if [ -z "${expiry_epoch}" ]; then
+              continue
+            fi
+            if [ "${expiry_epoch}" -gt "${newest_subkey_expiry}" ]; then
+              newest_subkey_expiry="${expiry_epoch}"
+            fi
+          done < <(gpg --with-colons --list-keys "${{ vars.PRIMARY_FPR }}")
+
+          # Lead window = the publish-time floor (OVERLAP_DAYS) plus 30d of slack,
+          # so this monthly job trips ~30d BEFORE publish would start refusing.
+          lead_days=$(( ${{ vars.OVERLAP_DAYS }} + 30 ))
+
+          min_required_expiry=$(( now + lead_days * 86400 ))
+
+          if [ "${newest_subkey_expiry}" -lt "${min_required_expiry}" ]; then
+            echo "::error::newest signing subkey expires in < ${lead_days}d (exp=${newest_subkey_expiry} min_required=${min_required_expiry}). Mint a fresh subkey pool per docs/KEY-ROTATION.md."
+            exit 1
+          fi
+
+          echo "::notice::newest subkey expiry ${newest_subkey_expiry} is >= ${lead_days}d out"
+
+      - name: Guard B — refuse if the subkey pool is nearly exhausted
+        env:
+          ACTIVE_IDX: ${{ steps.compute.outputs.active_idx }}
+          SUBKEY_COUNT: ${{ steps.compute.outputs.subkey_count }}
+        run: |
+          set -euo pipefail
+
+          # Warn while two subkeys remain (active + next), i.e. before we reach the
+          # last usable pair. This front-runs Guard A by a full rotation period.
+          if [ "${ACTIVE_IDX}" -ge $(( SUBKEY_COUNT - 2 )) ]; then
+            echo "::error::active index ${ACTIVE_IDX} of ${SUBKEY_COUNT} — the subkey pool is nearly exhausted. Mint a fresh pool per docs/KEY-ROTATION.md before it runs out."
+            exit 1
+          fi
+
+          echo "::notice::subkey pool healthy (idx ${ACTIVE_IDX} of ${SUBKEY_COUNT})"
+
+      - name: Publish active + next fingerprints to secrets
+        env:
+          OP_VAULT: ${{ secrets.OP_VAULT }}
+          OP_ITEM: ${{ secrets.OP_GPG_ITEM }}
+          NEXT_FPR: ${{ steps.compute.outputs.next_fpr }}
+          ACTIVE_IDX: ${{ steps.compute.outputs.active_idx }}
+          ACTIVE_FPR: ${{ steps.compute.outputs.active_fpr }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Single source of truth for the publish workflow: three named fields.
+          # Publish reads active_fpr/next_fpr directly and cross-checks them
+          # against fpr_idx + the gpg_subkey_fpr_N table.
+          #
+          # Two `op item edit` gotchas are handled below:
+          #   1. These fields live in the `active_subkeys` section, so each
+          #      assignment MUST be section-qualified (`section.label[type]=value`).
+          #      A bare `active_fpr[text]=...` targets a non-existent top-level
+          #      field and `op` rejects it with "invalid JSON provided".
+          #   2. `op item edit` inherits the runner's open stdin and misreads it
+          #      as piped JSON, ALSO failing with "invalid JSON provided" (known
+          #      1Password CLI bug in GitHub Actions, op >= 2.23). Redirect stdin
+          #      from /dev/null so `op` never treats stdin as an edit payload.
+          op item edit "${OP_ITEM}" \
+            --vault "${OP_VAULT}" \
+            "active_subkeys.next_fpr[text]=${NEXT_FPR}" \
+            "active_subkeys.fpr_idx[text]=${ACTIVE_IDX}" \
+            "active_subkeys.active_fpr[text]=${ACTIVE_FPR}" </dev/null >/dev/null
+
+          echo "::notice::wrote active_fpr/next_fpr/fpr_idx to secrets (idx=${ACTIVE_IDX})"
+
+      - name: Auto-republish so the rotation reaches clients
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh workflow run publish.yaml \
+            --repo "${{ github.repository }}" \
+            -f reason="scheduled key rotation (auto-republish)"
+
+          echo "::notice::dispatched publish.yaml to re-sign with the rotated keys"
