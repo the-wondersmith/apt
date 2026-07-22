@@ -61,7 +61,7 @@ jobs:
           # floating `latest` default silently shifting the runner's op version.
           # 2.35.0 has an `op item edit` stdin bug, already mitigated by the
           # `</dev/null` redirect on this workflow's write step.
-          version: 2.38.0
+          version: 2.35.0
 
       - id: gpg
         name: Load signing subkeys into an ephemeral keyring

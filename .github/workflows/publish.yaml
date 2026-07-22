@@ -86,7 +86,7 @@ jobs:
           # cache.agilebits.com. publish only READS via op, so the 2.35.0
           # `op item edit` stdin bug does not apply here; pinning keeps the
           # runtime reproducible.
-          version: 2.38.0
+          version: 2.35.0
 
       - id: gpg
         name: Load signing material into an ephemeral keyring
