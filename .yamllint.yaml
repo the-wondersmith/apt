@@ -1,0 +1,24 @@
+---
+extends: default
+
+yaml-files:
+  - "*.yml"
+  - "*.yaml"
+
+# Only lint repo-authored YAML; never descend into build output or the
+# durable pool checkout that CI materializes at publish time.
+ignore: |
+  site/
+  _pool/
+  node_modules/
+
+rules:
+  # GitHub Actions workflows use `on:` as a mapping key, which yamllint would
+  # otherwise flag as a truthy value. Skip key checks; still check values.
+  truthy:
+    check-keys: false
+
+  # Align with editorconfig; long shell/heredoc lines in workflows are common.
+  line-length:
+    max: 120
+    level: warning

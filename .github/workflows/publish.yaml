@@ -246,9 +246,9 @@ jobs:
       - name: Rehydrate build tree from the durable pool
         run: |
           set -euo pipefail
-          
+
           mkdir -p site/pool
-          
+
           if [ -d _pool/pool ]; then
             cp -a _pool/pool/. site/pool/
           fi
@@ -318,19 +318,19 @@ jobs:
           set -euo pipefail
           test -n "${TARGET_TAG}"
           test -n "${TARGET_REPO}"
-          
+
           mkdir -p incoming
           gh release download "${TARGET_TAG}" --repo "${TARGET_REPO}" --pattern '*.deb' --dir incoming
-          
+
           shopt -s nullglob
 
           packages=(incoming/*.deb)
-          
+
           if [ "${#packages[@]}" -eq 0 ]; then
             echo "::error::no .deb assets on ${TARGET_REPO}@${TARGET_TAG}"
             exit 1
           fi
-          
+
           # --- Provenance verification (Tier-2 hardening) ---
           # Reject anything that is not a published, attested asset of the exact
           # release named in the dispatch. Runs BEFORE the arch floor and pooling
@@ -366,7 +366,7 @@ jobs:
             fi
           done
           # --- end provenance verification ---
-          
+
           # Validate the arch floor BEFORE pooling anything (no partial ingest):
           # each package name must be a single Architecture:all build OR provide
           # BOTH amd64 AND arm64 (extra arches allowed).
@@ -482,9 +482,9 @@ jobs:
       - name: Stage public key + Pages markers
         run: |
           set -euo pipefail
-          
+
           cp "${RUNNER_TEMP}/pubkey.asc" site/pubkey.asc
-          
+
           touch site/.nojekyll
 
       - name: Build bootstrap tarball
@@ -498,7 +498,7 @@ jobs:
           # dearmor the published cert into a binary keyring apt consumes via `signed-by`
           gpg --dearmor < site/pubkey.asc > "${root}/usr/share/keyrings/wondersmith-apt.gpg"
           chmod 0644 "${root}/usr/share/keyrings/wondersmith-apt.gpg"
-          
+
           {
             printf 'deb [signed-by=/usr/share/keyrings/wondersmith-apt.gpg] ';
             printf 'https://the-wondersmith.github.io/apt %s %s\n' "${SUITE}" "${COMPONENT}";
@@ -555,17 +555,17 @@ jobs:
           ACTIVE_FPR: ${{ steps.gpg.outputs.active_fpr }}
         run: |
           set -euo pipefail
-          
+
           rm -rf _pool/pool
-          
+
           mkdir -p _pool/pool/main
-          
+
           if [ -d site/pool ]; then
             cp -a site/pool/. _pool/pool/
           fi
-          
+
           touch _pool/pool/main/.gitkeep
-          
+
           # Reviewer M4: mirror the public cert into the pool as a resilience backup.
           cp "${RUNNER_TEMP}/pubkey.asc" _pool/pubkey.asc
 
@@ -578,13 +578,13 @@ jobs:
             -u "${ACTIVE_FPR}!" \
             --detach-sign --armor \
             -o _pool/pool.sha256.asc _pool/pool.sha256
-          
+
           cd _pool
 
           git config user.name  "wondersmith-apt-control-plane[bot]"
           git config user.email "github@wondersmith.dev"
           git add -A
-          
+
           if git diff --cached --quiet; then
             echo "pool unchanged; nothing to commit"
           else
