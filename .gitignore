@@ -1,0 +1,4 @@
+# The 'pool' branch is the durable package pool: .deb files ARE tracked here.
+# Only OS/editor cruft is ignored.
+.DS_Store
+*.swp

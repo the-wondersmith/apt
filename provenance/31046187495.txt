@@ -1,0 +1,11 @@
+timestamp:   2026-08-05T20:53:50Z
+run:         31046187495
+run_url:     https://github.com/the-wondersmith/apt/actions/runs/31046187495
+dispatcher:  the-wondersmith
+event:       repository_dispatch
+source_repo: the-wondersmith/containers
+source_tag:  v6.0.2-2
+active_fpr:  A8554A859497ADD4EE8E8B97C9DFB3B14BEEFEF4
+assets:
+  7427415d8368a9fa36869054c76ec4b240dc0d01aa9e86ab0247ae69b95fafc4  site/pool/main/p/podman/podman_6.0.2-2_amd64.deb
+  cd99ed57c3253430fe9153aef77e76a53630918f900b5fe730c128f583b2cfa4  site/pool/main/p/podman/podman_6.0.2-2_arm64.deb

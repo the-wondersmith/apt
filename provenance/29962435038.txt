@@ -1,0 +1,10 @@
+timestamp:   2026-07-22T22:19:40Z
+run:         29962435038
+run_url:     https://github.com/the-wondersmith/apt/actions/runs/29962435038
+dispatcher:  the-wondersmith
+event:       repository_dispatch
+source_repo: the-wondersmith/pve-modkit
+source_tag:  v0.1.1
+active_fpr:  A8554A859497ADD4EE8E8B97C9DFB3B14BEEFEF4
+assets:
+  f27d6ab9f1557b0d677e87e446032fe3515fad668204e8568e195c812033f63b  site/pool/main/p/pve-modkit/pve-modkit_0.1.1_all.deb
