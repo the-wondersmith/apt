@@ -1,0 +1,10 @@
+timestamp:   2026-09-01T08:16:54Z
+run:         33486197110
+run_url:     https://github.com/the-wondersmith/apt/actions/runs/33486197110
+dispatcher:  github-actions[bot]
+event:       workflow_dispatch
+source_repo: manual
+source_tag:  bootstrap
+active_fpr:  A8554A859497ADD4EE8E8B97C9DFB3B14BEEFEF4
+assets:
+  none (re-sign / bootstrap; no assets ingested)
